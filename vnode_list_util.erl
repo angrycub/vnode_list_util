@@ -1,6 +1,7 @@
 %% -------------------------------------------------------------------
 %%
-%% key_list_util: utility console script for per-vnode key counting, siblings logging and more
+%% vnode_list_util: utility console script for per-vnode key counting, 
+%%                  siblings logging and more
 %%
 %% Copyright (c) 2014 Basho Technologies, Inc.  All Rights Reserved.
 %%
@@ -22,8 +23,9 @@
 
 %% TODOs
 %% * replace foreach loops with foldl loops, taking errors into account and returning them
+%% * once upon a time
 
--module(key_list_util).
+-module(vnode_list_util).
 -compile(export_all).
 -compile([{parse_transform, lager_transform}]).
 
@@ -389,14 +391,14 @@ processOptions([Option|Rest], Vnode, OutputDir, SleepFor, InitialAccumulator, {U
             ProcessFun = case SleepFor of
                 SleepPeriod when is_integer(SleepPeriod)->
                     fun(Bucket, Key, _Object, _ObjBinary, AccDict) ->
-                        io:format(File,"~p,~s~n", [Bucket, binary_to_list(Key)]),
+                        io:format(File,"{~p,~p}.~n", [Bucket, Key]),
                         timer:sleep(SleepPeriod),
                         AccDict
                     end;
 
                 undefined -> 
                     fun(Bucket, Key, _Object, _ObjBinary, AccDict) ->
-                        io:format(File,"~p,~s~n", [Bucket, binary_to_list(Key)]),
+                        io:format(File,"{~p,~p}.~n", [Bucket, Key]),
                         AccDict
                     end;
 
@@ -406,13 +408,54 @@ processOptions([Option|Rest], Vnode, OutputDir, SleepFor, InitialAccumulator, {U
             processOptions(Rest, Vnode, OutputDir, SleepFor, InitialAccumulator, {Uses, [ProcessFun | Funs]});
 
         count_keys ->
-            ProcessFun = fun(Bucket, _Key, _Object, _ObjBinary, AccDict) ->
-                CountDict = dict:update_counter(Bucket, 1, dict:fetch(<<"BucketKeyCounts">>, AccDict)),
-                dict:store(<<"BucketKeyCounts">>, CountDict, AccDict)
+            ProcessFun = fun(Bucket, _Key, _Object, _ObjBinary, ProcessAccDict) ->
+                CountDict = dict:update_counter(Bucket, 1, dict:fetch(<<"BucketKeyCounts">>, ProcessAccDict)),
+                dict:store(<<"BucketKeyCounts">>, CountDict, ProcessAccDict)
             end,
             NewAccumulator = dict:store(<<"BucketKeyCounts">>, dict:new(), InitialAccumulator),
             processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {Uses, [ProcessFun | Funs]});
 
+        delete_object ->
+            ProcessFun = fun(Bucket, Key, _Object, _ObjBinary, ProcessAccDict) ->
+                {ok, Client} = riak:local_client(),
+                case Client:delete(Bucket, Key) of 
+                    ok ->
+                        DeleteCountDict = dict:update_counter(success, 1, dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict));
+                    _ -> 
+                        DeleteCountDict = dict:update_counter(error, 1, dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict))
+                end,
+                dict:store(<<"DeleteResultCounts">>, DeleteCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"DeleteResultCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {Uses, [ProcessFun | Funs]});
+
+        {copy_object, DestinationBucket} ->
+            ProcessFun = fun(_Bucket, Key, Object, _ObjBinary, ProcessAccDict) ->
+                {ok, Client} = riak:local_client(),
+                case Client:put(riak_object:new(DestinationBucket, Key, riak_object:get_values(Object), riak_object:get_metadatas(Object))) of 
+                    ok ->  
+                        CopyCountDict = dict:update_counter(success, 1, dict:fetch(<<"CopyResultCounts">>, ProcessAccDict));
+                    _ -> 
+                        CopyCountDict = dict:update_counter(false, 1, dict:fetch(<<"CopyResultCounts">>, ProcessAccDict))
+                end,
+                dict:store(<<"CopyResultCounts">>, CopyCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"CopyResultCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {true, [ProcessFun | Funs]});
+
+        direct_delete_object ->
+            ProcessFun = fun(Bucket, Key, _Object, _ObjBinary, ProcessAccDict) ->
+                case local_direct_delete(Vnode, Bucket, Key) of 
+                    ok ->
+                        DeleteCountDict = dict:update_counter(success, 1, dict:fetch(<<"DirectDeleteResultCounts">>, ProcessAccDict));
+                    _ -> 
+                        DeleteCountDict = dict:update_counter(error, 1, dict:fetch(<<"DirectDeleteResultCounts">>, ProcessAccDict))
+                end,
+                dict:store(<<"DirectDeleteResultCounts">>, DeleteCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"DirectDeleteResultCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {Uses, [ProcessFun | Funs]});
+            
         log_siblings ->
             error("log_siblings is not implemented yet",[]);
 
@@ -470,6 +513,24 @@ processFilters([Option|Rest], Vnode, {ProcessAccumulator, Uses, Funs} = Acc) ->
                 isBinaryPrefix(KeyPrefix, Key)
             end,
             processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+            
+        {object_size_gte, ThresholdSize} ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, _Object, Binary) ->
+                erlang:byte_size(Binary) >= ThresholdSize
+            end,
+            processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+
+        {sibling_count_gte, ThresholdCount} ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
+                length(riak_object:get_values(Object)) >= ThresholdCount
+            end,
+            processFilters(Rest, Vnode, {ProcessAccumulator, true, [FilterFun | Funs]});
+
+        {sibling_count_gte, ThresholdCount} ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
+                length(riak_object:get_values(Object)) >= ThresholdCount
+            end,
+            processFilters(Rest, Vnode, {ProcessAccumulator, true, [FilterFun | Funs]});
 
         _ -> 
             processFilters(Rest, Vnode, Acc)
