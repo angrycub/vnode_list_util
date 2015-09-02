@@ -849,7 +849,7 @@ build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iterat
                 add_index_to_bstr(<<"Key">>, I), 
                 add_index_to_bstr(<<"Value">>, I)))
     end, lists:seq(StartIndex,EndIndex)),
-    case Iteration =< NumIterations of
+    case Iteration < NumIterations of
         true ->
             case timer:apply_after(
                 WaitTime,
