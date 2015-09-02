@@ -26,7 +26,22 @@
 %% * once upon a time
 
 -module(vnode_list_util).
--compile(export_all).
+-export([
+    count_everything/1,
+    count_all_keys/1,
+    count_all_keys_for_bucket/2,
+    log_all_keys/1,
+    log_all_keys/2,
+    log_all_keys_for_bucket/2,
+    log_all_keys_for_bucket/3,
+    resolve_all_siblings/1,
+    resolve_all_siblings_for_bucket/2
+    ]).
+
+-export([process_cluster_parallel/2, process_node/2]).
+
+-export([build_test_data/0, build_time_test_data/6, clean_cluster/0, vnode_get/2]).
+
 -compile([{parse_transform, lager_transform}]).
 
 % Describes the Contents of a Riak object. A "sibling" is an instance of this record.
@@ -36,42 +51,468 @@
           value :: term()
          }).
 
+
+%% #################################################################################################
+%% #                 ###############################################################################
+%% # Public API funs ###############################################################################
+%% #                 ###############################################################################
+%% #################################################################################################
+
 %% =================================================================================================
 %% In the following functions, Bucket can be a Bucket or a {BucketType, Bucket} pair.
-%% Including this parameter implies the operation will be run only upon the specified Bucket or pair.
+%% Including this parameter implies the operation will be run only upon the specified Bucket 
+%% or pair.
+
+count_everything(OutputDir) ->
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, count_keys, {vnodes,all}]).
 
 count_all_keys(OutputDir) ->
-    process_cluster_parallel(OutputDir, [{output_dir,OutputDir}, count_keys]).
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, count_keys]).
 
 count_all_keys_for_bucket(OutputDir, Bucket) ->
-    process_cluster_parallel(OutputDir, [{output_dir,OutputDir}, count_keys, {bucket_name, Bucket}]).
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, count_keys, {bucket_name, Bucket}]).
 
 log_all_keys(OutputDir) ->
-    process_cluster_parallel(OutputDir, [{output_dir,OutputDir}, log_keys]).
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, log_keys]).
+
+log_all_keys(OutputDir, SleepPeriod) -> %% SleepPeriod is in milliseconds.
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, log_keys, {sleep_for, SleepPeriod}]).
 
 log_all_keys_for_bucket(OutputDir, Bucket) ->
-    process_cluster_parallel(OutputDir, [{output_dir,OutputDir}, log_keys, {bucket_name, Bucket}]).
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, log_keys, {bucket_name, Bucket}]).
 
-% SleepPeriod - optional amount of time to sleep between each key operation,
-% in milliseconds
-log_all_keys(OutputDir, SleepPeriod) ->
-    process_cluster_parallel(OutputDir, [{output_dir,OutputDir}, log_keys, {sleep_for, SleepPeriod}]).
-
-log_all_keys_for_bucket(OutputDir, Bucket, SleepPeriod) ->
-    process_cluster_parallel(OutputDir, [{output_dir,OutputDir}, log_keys, {sleep_for, SleepPeriod}, {bucket_name, Bucket}]).
+log_all_keys_for_bucket(OutputDir, Bucket, SleepPeriod) -> %% SleepPeriod is in milliseconds.
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, log_keys, {sleep_for, SleepPeriod}, {bucket_name, Bucket}]).
 
 resolve_all_siblings(OutputDir) ->
-    process_cluster_serial(OutputDir, [{output_dir,OutputDir}, log_siblings, resolve_siblings]).
+    process_cluster_serial(OutputDir, 
+        [{output_dir,OutputDir}, log_siblings, resolve_siblings]).
 
 resolve_all_siblings_for_bucket(OutputDir, Bucket) ->
-    process_cluster_serial(OutputDir, [{output_dir,OutputDir},log_siblings, resolve_siblings, {bucket_name, Bucket}]).
+    process_cluster_serial(OutputDir, 
+        [{output_dir,OutputDir},log_siblings, resolve_siblings, {bucket_name, Bucket}]).
 
-local_direct_delete(Index, Bucket, Key) when
-    is_integer(Index),
-    is_binary(Bucket),
-    is_binary(Key) ->
-    DeleteReq = {riak_kv_delete_req_v1, {Bucket, Key}, make_ref()},
-    riak_core_vnode_master:sync_command({Index, node()}, DeleteReq, riak_kv_vnode_master).
+
+
+
+
+
+
+
+%% #################################################################################################
+%% #                 ###############################################################################
+%% # Processing funs ###############################################################################
+%% #                 ###############################################################################
+%% #################################################################################################
+
+%% =================================================================================================
+%% For each node in the cluster, in parallel, load this module,
+%% and invoke the process_node() function on its vnodes.
+
+process_cluster_parallel(OutputDir, Options) ->
+    io:format("Scanning all nodes in parallel...~n"),
+    Members = member_nodes(),
+    load_module_on_nodes(?MODULE, Members),
+    {Results, Failures} = riak_core_util:rpc_every_member_ann(
+        ?MODULE, process_node, [OutputDir, Options], timer:hours(24)),
+%%    io:format("{Results, Failures} = {~p,~p}",[Results, Failures]),
+    case Failures of 
+        [] ->
+            FoldFun = fun({_Node, ResultDict}, Accumulator) when 
+                is_tuple(ResultDict), 
+                element(1,ResultDict) =:= dict ->
+                    dict:merge(fun dict_merge_fun/3, ResultDict, Accumulator);
+            ({Node, BrokeDict}, _Acc) ->
+                io:format("~p~n",[BrokeDict]),
+                lager:error("~s didn't return a tagged orddict. ~p",[Node, BrokeDict]),
+                throw(lists:flatten(io_lib:format("~s didn't return a tagged orddict.", [Node])))
+            end,
+
+            ClusterCountsFilename = filename:join(OutputDir, 
+                [io_lib:format("cluster-counts.log", [])]),
+            ClusterResults = lists:foldl(FoldFun, dict:new(), Results),
+            write_node_totals(ClusterCountsFilename, ClusterResults),
+            dict_pretty_print(ClusterResults);
+        Failures ->
+            lager:warning(
+                "Skipping cluster totals--One or more nodes failed to respond. [~p]",[Failures])
+    end,
+
+    io:format("Done.~n", []).
+
+% For each node in the cluster, load this module,
+% and invoke the process_node() function on its vnodes.
+process_cluster_serial(OutputDir, Options) ->
+    io:format("Scanning all nodes serially...~n"),
+    Members = member_nodes(),
+    load_module_on_nodes(?MODULE, Members),
+    NodeFun = fun(Node) ->
+        io:format("Processing node ~p~n", [Node]),
+        rpc:call(Node, ?MODULE, process_node, [OutputDir, Options])
+    end,
+    lists:foreach(NodeFun, Members),
+    io:format("Done.~n").
+
+
+% Invoked on each member node in the ring
+% Calls process_vnode() on each vnode local to this node.
+process_node(OutputDir, Options) ->
+    SelectedVNodes  = case proplists:get_value(vnodes,Options,primaries) of
+        primaries -> 
+            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+            Owners = riak_core_ring:all_owners(Ring),
+            [Index || {Index, Owner} <- Owners, Owner =:= node()];
+        running ->
+            [Index || {riak_kv_vnode,Index,_Owner} <- riak_core_vnode_manager:all_vnodes()];
+        fallbacks ->
+            {ok,Ring} = riak_core_ring_manager:get_my_ring(),
+            Locals = lists:foldl(
+                fun({Idx, Pid}, Acc) -> 
+                    [{Idx, Pid, riak_core_ring:index_owner(Ring, Idx)}|Acc]
+                end, 
+                [],
+                riak_core_vnode_manager:all_index_pid(riak_kv_vnode)),
+            [Index || {Index,_Pid,Owner} <- Locals, Owner =/= node()];
+        all ->
+            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+            Owners = riak_core_ring:all_owners(Ring),
+            [Index || {Index, _Owner} <- Owners];
+        VNodeList when is_list(VNodeList) ->
+            CleanItems = [Index || Index <- VNodeList, is_integer(Index) ],
+            if 
+                length(CleanItems) =/= length(VNodeList) -> 
+                    lager:warning("VNodeList contains non-integer items",[]);
+                true -> ok
+            end,
+            CleanItems;
+        Option ->
+            lager:error("Invalid `vnodes` option. [~p]",[Option])
+    end,
+    lager:info("SelectedVNodes = ~p.",[length(SelectedVNodes)]),
+    NodeResults = lists:foldl(
+        fun(VNode, NodeResultAccumulator) -> 
+            process_vnode(VNode, OutputDir, Options, NodeResultAccumulator) 
+        end, dict:new(), SelectedVNodes),
+    NodeCountsFilename = filename:join(OutputDir, [io_lib:format("~s-counts.log", [node()])]),
+    write_node_totals(NodeCountsFilename, NodeResults),
+    NodeResults.
+
+% Performs a riak_kv_vnode:fold(), and invokes logging functions for each key in this partition
+process_vnode(VNode, OutputDir, Options, NodeResultAccumulator) ->
+    Node = node(),
+
+    CountsFilename = filename:join(OutputDir, [io_lib:format("~s-~p-counts.log", [Node, VNode])]),
+
+    {InitialAccumulator,ProcessObj} = processObj(Options, VNode),
+
+    lager:info("Begin processing partition ~p, with options: ~p",[VNode, Options]),
+
+    Results = riak_kv_vnode:fold({VNode, Node}, ProcessObj, InitialAccumulator),
+    NewNodeResultAccumulator = write_vnode_totals(CountsFilename, Results, NodeResultAccumulator),
+
+    lager:info("Complete processing partition ~p",[VNode]),
+    NewNodeResultAccumulator.
+
+write_vnode_totals(OutputFilename, Results, NodeResultAccumulator) ->
+    lager:info("~nResults:~n~s~nNodeResultAccumulator:~n~s~n",
+        [dict_pretty_print(Results), dict_pretty_print(NodeResultAccumulator)]), 
+    NewNodeResultAccumulator = dict:merge(fun dict_merge_fun/3, Results, NodeResultAccumulator),
+    case dict:is_key(<<"BucketKeyCounts">>, Results) of
+        true ->
+            VNodeKeyCountDict = case dict:is_key(<<"VNodeKeyCounts">>, NodeResultAccumulator) of
+                true -> dict:fetch(<<"VNodeKeyCounts">>, NodeResultAccumulator);
+                false -> dict:new()
+            end,
+
+            {ok, File} = file:open(OutputFilename, [write]),
+            Counts = dict:to_list(dict:fetch(<<"BucketKeyCounts">>, Results)),
+            WriteBucketFun = fun(BucketCount, VNodeKeyCountAcc) ->
+                {Bucket, Count} = BucketCount,
+                io:format(File,"{~p,~B}.~n", [Bucket, Count]),
+                dict:update_counter(Bucket, Count, VNodeKeyCountAcc)
+            end,
+            NewVNodeKeyCountDict = lists:foldl(WriteBucketFun, VNodeKeyCountDict, Counts), 
+            file:close(File),
+            NewNodeResultAccumulator;
+
+        _ -> NewNodeResultAccumulator %% TODO return a result
+    end.
+
+write_node_totals(OutputFilename, Results) ->
+    case dict:is_key(<<"VNodeKeyCounts">>, Results) of
+        true ->
+            {ok, File} = file:open(OutputFilename, [write]),
+            Counts = dict:to_list(dict:fetch(<<"VNodeKeyCounts">>, Results)),
+            WriteBucketFun = fun(BucketCount) ->
+                {Bucket, Count} = BucketCount,
+                io:format(File,"{~p,~B}.~n", [Bucket, Count])
+            end,
+            lists:foreach(WriteBucketFun, Counts),
+            file:close(File);
+        _ -> ok 
+    end.
+
+
+
+
+
+
+
+
+%% #################################################################################################
+%% #                        ########################################################################
+%% # Object Processing funs ########################################################################
+%% #                        ########################################################################
+%% #################################################################################################
+
+processOptions(Options, VNode, Acc) ->
+    OutputDir = proplists:get_value(output_dir, Options, "/var/tmp"),
+    SleepFor = proplists:get_value(sleep_for, Options, undefined),
+    InitialAccumulator = dict:new(),    
+    processOptions(Options, VNode, OutputDir, SleepFor, InitialAccumulator, Acc).
+
+processOptions([], _VNode, _OutputDir, _SleepFor, InitialAccumulator, {Uses, Funs}) ->
+    {InitialAccumulator, Uses, Funs};
+
+processOptions([Option|Rest], VNode, OutputDir, SleepFor, InitialAccumulator, {Uses, Funs} = Acc) ->
+    Node = node(), 
+
+    case Option of
+        log_keys ->
+            KeysFilename = filename:join(
+                OutputDir, [io_lib:format("~s-~p-keys.log", [Node, VNode])]),
+            {ok, File} = file:open(KeysFilename, [write]),
+            ProcessFun = case SleepFor of
+                SleepPeriod when is_integer(SleepPeriod)->
+                    fun(Bucket, Key, _Object, _ObjBinary, AccDict) ->
+                        io:format(File,"{~p,~p}.~n", [Bucket, Key]),
+                        timer:sleep(SleepPeriod),
+                        AccDict
+                    end;
+
+                undefined -> 
+                    fun(Bucket, Key, _Object, _ObjBinary, AccDict) ->
+                        io:format(File,"{~p,~p}.~n", [Bucket, Key]),
+                        AccDict
+                    end;
+
+                Stupid ->
+                    throw(io_lib:format("Bad value provided for `sleep_for` - [~p]",[Stupid]))
+                end,            
+            processOptions(Rest, VNode, OutputDir, SleepFor, InitialAccumulator, 
+                {Uses, [ProcessFun | Funs]});
+
+        count_keys ->
+            ProcessFun = fun(Bucket, _Key, _Object, _ObjBinary, ProcessAccDict) ->
+                CountDict = dict:update_counter(Bucket, 1, 
+                    dict:fetch(<<"BucketKeyCounts">>, ProcessAccDict)),
+                dict:store(<<"BucketKeyCounts">>, CountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"BucketKeyCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                {Uses, [ProcessFun | Funs]});
+
+        delete_object ->
+            ProcessFun = fun(Bucket, Key, _Object, _ObjBinary, ProcessAccDict) ->
+                {ok, Client} = riak:local_client(),
+                case Client:delete(Bucket, Key) of 
+                    ok ->
+                        DeleteCountDict = dict:update_counter(success, 1, 
+                            dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict));
+                    _ -> 
+                        DeleteCountDict = dict:update_counter(error, 1, 
+                            dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict))
+                end,
+                dict:store(<<"DeleteResultCounts">>, DeleteCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"DeleteResultCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                {Uses, [ProcessFun | Funs]});
+
+        {copy_object, DestinationBucket} ->
+            ProcessFun = fun(_Bucket, Key, Object, _ObjBinary, ProcessAccDict) ->
+                {ok, Client} = riak:local_client(),
+                case Client:put(
+                    riak_object:new(
+                        DestinationBucket, Key, riak_object:get_values(Object), 
+                        riak_object:get_metadatas(Object))) of 
+                    ok ->  
+                        CopyCountDict = dict:update_counter(success, 1, 
+                            dict:fetch(<<"CopyResultCounts">>, ProcessAccDict));
+                    _ -> 
+                        CopyCountDict = dict:update_counter(false, 1, 
+                            dict:fetch(<<"CopyResultCounts">>, ProcessAccDict))
+                end,
+                dict:store(<<"CopyResultCounts">>, CopyCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"CopyResultCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                {true, [ProcessFun | Funs]});
+
+       direct_delete_replica ->
+            ProcessFun = fun(Bucket, Key, Object, _ObjBinary, ProcessAccDict) ->
+                send_delete_message_to_vnode(VNode, {Bucket, Key}, Object),
+                DirectDeleteCountDict = dict:update_counter(delete_requested, 1, 
+                    dict:fetch(<<"DirectDeleteResultCounts">>, ProcessAccDict)),
+                dict:store(<<"DirectDeleteResultCounts">>, DirectDeleteCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"DirectDeleteResultCounts">>, 
+                dict:new(), InitialAccumulator),
+            processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                {true, [ProcessFun | Funs]});
+            
+        log_siblings ->
+            error("log_siblings is not implemented yet",[]);
+        
+        {custom_processing_fun, ProcessFun, NeedsUnserializedObject, AccumulatorKey} when 
+        is_function(ProcessFun, 5), is_boolean(NeedsUnserializedObject) ->
+            NewAccumulator = dict:store(AccumulatorKey, dict:new(), InitialAccumulator),
+            case NeedsUnserializedObject of
+                true ->
+                    processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                        {true, [ProcessFun | Funs]});
+                false ->
+                    processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                        {Uses, [ProcessFun | Funs]});
+                _ ->
+                    erlang:error(badarg)
+            end;
+        _ -> 
+            processOptions(Rest, VNode, OutputDir, SleepFor, InitialAccumulator, Acc)
+    end.        
+
+processObj(Options, VNode) ->
+    {ProcessAccumulator, ProcessesUseObjects, FoldFuns} = 
+        processOptions(Options, VNode, {false,[]}),
+    {InitialAccumulator, FiltersUseObjects, FilterFuns} = 
+        processFilters(Options, VNode, {ProcessAccumulator,false,[]}),
+
+    UseObjects = ProcessesUseObjects or FiltersUseObjects,
+
+    ProcessFun = fun({Bucket, Key}, ObjBinary, AccDict) ->
+        {BucketType, BucketName} = case is_tuple(Bucket) of 
+            true ->
+                Bucket;
+            _ ->
+                {none, Bucket}
+        end,
+        Object = case UseObjects of 
+            true -> unserialize(Bucket, Key, ObjBinary);
+            false -> not_unserialized
+        end,
+        case lists:dropwhile(
+            fun(X) -> X(BucketType, BucketName, Key, Object, ObjBinary) end, FilterFuns) of 
+            [] -> lists:foldl(
+                fun(X, Acc) -> X(Bucket, Key, Object, ObjBinary, Acc) end, AccDict, FoldFuns);
+            _ -> AccDict   %% One of the filters evaluated to false so skip this object
+        end
+    end,
+    {InitialAccumulator, ProcessFun}.
+
+
+
+
+
+
+
+%% #################################################################################################
+%% #             ###################################################################################
+%% # Filter funs ###################################################################################
+%% #             ###################################################################################
+%% #################################################################################################
+
+processFilters([], _VNode, {ProcessAccumulator, Uses, Funs}) ->
+    {ProcessAccumulator, Uses, lists:reverse(Funs)};
+
+processFilters([Option|Rest], VNode, {ProcessAccumulator, Uses, Funs} = Acc) ->
+    case Option of
+        {bucket_type, FilteredBucketType} ->
+            FilterFun = fun(BucketType, _BucketName, _Key, _Object, _Binary) ->
+                FilteredBucketType =:= BucketType
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+
+        {bucket_name, FilteredBucketName} ->
+            FilterFun = fun(_BucketType, BucketName, _Key, _Object, _Binary) ->
+                FilteredBucketName =:= BucketName
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+        
+        {bucket_name_prefix, BucketPrefix} ->
+            FilterFun = fun(_BucketType, BucketName, _Key, _Object, _Binary) ->
+                isBinaryPrefix(BucketPrefix, BucketName)
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+
+        {key_prefix, KeyPrefix} ->
+            FilterFun = fun(_BucketType, _BucketName, Key, _Object, _Binary) ->
+                isBinaryPrefix(KeyPrefix, Key)
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+            
+        {object_size_gte, ThresholdSize} ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, _Object, Binary) ->
+                erlang:byte_size(Binary) >= ThresholdSize
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+
+        {sibling_count_gte, ThresholdCount} ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
+                length(riak_object:get_values(Object)) >= ThresholdCount
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
+
+        {create_date_lte, ThresholdCount} ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
+                length(riak_object:get_values(Object)) >= ThresholdCount
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
+
+        is_tombstone ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
+                riak_kv_util:is_x_deleted(Object)
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
+
+        is_not_tombstone ->
+            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
+                not(riak_kv_util:is_x_deleted(Object))
+            end,
+            processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
+
+        {custom_filter_fun, FilterFun, NeedsUnserializedObject} when 
+            is_function(FilterFun, 5), is_boolean(NeedsUnserializedObject) ->
+            
+            case NeedsUnserializedObject of
+                true ->
+                    processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
+                false ->
+                    processFilters(Rest, VNode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
+                _ ->
+                    erlang:error(badarg)
+            end;
+        _ -> 
+            processFilters(Rest, VNode, Acc)
+    end.        
+
+
+
+
+
+
+
+%% #################################################################################################
+%% #             ###################################################################################
+%% # Helper funs ###################################################################################
+%% #             ###################################################################################
+%% #################################################################################################
 
 get_preflist_for_key(Bucket, Key, NValue) when 
     is_binary(Bucket),
@@ -87,11 +528,8 @@ get_preflist_for_key(Bucket, Key, NValue) when
     [IndexNode || {IndexNode, _Type} <- Preflist].
 
 
-%% =================================================================================================
-
-
-% Used for sorting an object's siblings in modified timestamp order (most recently modified to least)
-% Duplicated from riak_kv/riak_object (since it's not exported from that module)
+% Used for sorting an object's siblings in modified timestamp order (most recently modified 
+% to least). Duplicated from riak_kv/riak_object (since it's not exported from that module)
 compare_content_dates(C1, C2) ->
     D1 = dict:fetch(<<"X-Riak-Last-Modified">>, C1#r_content.metadata),
     D2 = dict:fetch(<<"X-Riak-Last-Modified">>, C2#r_content.metadata),
@@ -132,7 +570,8 @@ load_module_on_nodes(Module, Nodes) ->
             case rpc:multicall(Nodes, code, load_binary, [Module, File, Bin]) of
                 {_, []} -> ok;
                 {_, Failures} ->
-                    throw(lists:flatten(io_lib:format("Unable to reach the following nodes: ~p", [Failures])))
+                    throw(lists:flatten(
+                        io_lib:format("Unable to reach the following nodes: ~p", [Failures])))
             end;
         error ->
             error(lists:flatten(io_lib:format("unable to get_object_code(~s)", [Module])))
@@ -140,10 +579,12 @@ load_module_on_nodes(Module, Nodes) ->
 
 % Log the vtag, value and deleted status of a given sibling object
 log_sibling_contents(Obj, OutputFilename) ->
-    DateModified = calendar:now_to_local_time(dict:fetch(<<"X-Riak-Last-Modified">>, Obj#r_content.metadata)),
+    DateModified = calendar:now_to_local_time(
+        dict:fetch(<<"X-Riak-Last-Modified">>, Obj#r_content.metadata)),
     Deleted = is_deleted(Obj),
     Vtag = get_vtag(Obj),
-    Msg = io_lib:format("~p~n", [{{vtag, Vtag}, {date_modified, DateModified}, {is_deleted, Deleted}}]),
+    Msg = io_lib:format(
+        "~p~n", [{{vtag, Vtag}, {date_modified, DateModified}, {is_deleted, Deleted}}]),
     file:write_file(OutputFilename, Msg, [append]),
     Value = Obj#r_content.value,
     file:write_file(OutputFilename, io_lib:format("~p~n", [Value]), [append]).
@@ -179,7 +620,9 @@ resolve_object_siblings(OutputFilename, Bucket, Key, SiblingsByDate) ->
 force_reconcile(Bucket, Key, CorrectSibling) ->
     {ok, C} = riak:local_client(),
     {ok, OldObj} = C:get(Bucket, Key),
-    NewObj = riak_object:update_metadata(riak_object:update_value(OldObj, CorrectSibling#r_content.value), CorrectSibling#r_content.metadata),
+    NewObj = riak_object:update_metadata(
+        riak_object:update_value(OldObj, CorrectSibling#r_content.value), 
+        CorrectSibling#r_content.metadata),
     UpdatedObj = riak_object:apply_updates(NewObj),
     C:put(UpdatedObj, all, all).  % W=all, DW=all
 
@@ -213,7 +656,8 @@ log_or_resolve_siblings(OutputFilename, Bucket, Key, ObjBinary, Options) ->
         Msg = io_lib:format("~n~p~n", [{Bucket, Key, SiblingCount}]),
         file:write_file(OutputFilename, Msg, [append]),
 
-        lists:foreach(fun(Sibling) -> log_sibling_contents(Sibling, OutputFilename) end, SiblingsByDate),
+        lists:foreach(
+            fun(Sibling) -> log_sibling_contents(Sibling, OutputFilename) end, SiblingsByDate),
 
         case lists:member(resolve_siblings, Options) of
             true ->
@@ -227,314 +671,22 @@ member_nodes() ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     riak_core_ring:all_members(Ring).
 
-% For each node in the cluster, in parallel, load this module,
-% and invoke the process_node() function on its vnodes.
-process_cluster_parallel(OutputDir, Options) ->
-    io:format("Scanning all nodes in parallel...~n"),
-    Members = member_nodes(),
-    load_module_on_nodes(?MODULE, Members),
-    {Results, Failures} = riak_core_util:rpc_every_member_ann(?MODULE, process_node, [OutputDir, Options], 86400000),
-%%    io:format("{Results, Failures} = {~p,~p}",[Results, Failures]),
-    case Failures of 
-        [] ->
-            FoldFun = fun({_Node, ResultDict}, Accumulator) when is_tuple(ResultDict), element(1,ResultDict) =:= dict ->
-                case dict:is_key(<<"VnodeKeyCounts">>, ResultDict) of
-                    true ->
-                        TotalClusterCountDict = case dict:is_key(<<"VnodeKeyCounts">>, Accumulator) of
-                            true -> dict:fetch(<<"VnodeKeyCounts">>, Accumulator);
-                            false -> dict:new()
-                        end,
-
-                        Counts = dict:to_list(dict:fetch(<<"VnodeKeyCounts">>, ResultDict)),
-                        WriteBucketFun = fun(BucketCount, VnodeKeyCountAcc) ->
-                            {Bucket, Count} = BucketCount,
-                            dict:update_counter(Bucket, Count, VnodeKeyCountAcc)
-                        end,
-                        NewVnodeKeyCountDict = lists:foldl(WriteBucketFun, TotalClusterCountDict, Counts), 
-                        dict:store(<<"VnodeKeyCounts">>, NewVnodeKeyCountDict, Accumulator);
-                    _-> 
-                        Accumulator
-                end;
-            ({Node, BrokeDict}, _Acc) ->
-                io:format("~p~n",[BrokeDict]),
-                lager:error("~s didn't return a dict. ~p",[Node, BrokeDict]),
-                throw(lists:flatten(io_lib:format("~s didn't return a dict.", [Node])))
-            end,
-
-            ClusterCountsFilename = filename:join(OutputDir, [io_lib:format("cluster-counts.log", [])]),
-            ClusterResults = lists:foldl(FoldFun, dict:new(), Results),
-            write_node_totals(ClusterCountsFilename, ClusterResults);
-
-        Failures ->
-            lager:warning("Skipping cluster totals--One or more nodes failed to respond. [~p]",[Failures])
-    end,
-
-    io:format("Done.~n", []).
-
-% For each node in the cluster, load this module,
-% and invoke the process_node() function on its vnodes.
-process_cluster_serial(OutputDir, Options) ->
-    io:format("Scanning all nodes serially...~n"),
-    Members = member_nodes(),
-    load_module_on_nodes(?MODULE, Members),
-    NodeFun = fun(Node) ->
-        io:format("Processing node ~p~n", [Node]),
-        rpc:call(Node, ?MODULE, process_node, [OutputDir, Options])
-    end,
-    lists:foreach(NodeFun, Members),
-    io:format("Done.~n").
-
-
-% Invoked on each member node in the ring
-% Calls process_vnode() on each vnode local to this node.
-process_node(OutputDir, Options) ->
-    SelectedVnodes  = case proplists:get_value(vnodes,Options,primaries) of
-        primaries -> 
-            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-            Owners = riak_core_ring:all_owners(Ring),
-            [Index || {Index, Owner} <- Owners, Owner =:= node()];
-        running ->
-            [Index || {riak_kv_vnode,Index,_Owner} <- riak_core_vnode_manager:all_vnodes()];
-        fallbacks ->
-            {ok,Ring} = riak_core_ring_manager:get_my_ring(),
-            Locals = [{Idx,Pid,riak_core_ring:index_owner(Ring,Idx)} || {Idx,Pid} <- riak_core_vnode_manager:all_index_pid(riak_kv_vnode)],
-            [Index || {Index,_Pid,Owner} <- Locals, Owner =/= node()];
-        all ->
-            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-            Owners = riak_core_ring:all_owners(Ring),
-            [Index || {Index, _Owner} <- Owners];
-        VnodeList when is_list(VnodeList) ->
-            CleanItems = [Index || Index <- VnodeList, is_integer(Index) ],
-            if 
-                length(CleanItems) =/= length(VnodeList) -> 
-                    lager:warning("VnodeList contains non-integer items",[]);
-                true -> ok
-            end,
-            CleanItems;
-        Option ->
-            lager:error("Invalid `vnodes` option. [~p]",[Option])
-    end,
-    lager:info("SelectedVnodes = ~p.",[length(SelectedVnodes)]),
-    NodeResults = lists:foldl(fun(Vnode, NodeResultAccumulator) -> process_vnode(Vnode, OutputDir, Options, NodeResultAccumulator) end, dict:new(), SelectedVnodes),
-    NodeCountsFilename = filename:join(OutputDir, [io_lib:format("~s-counts.log", [node()])]),
-    write_node_totals(NodeCountsFilename, NodeResults),
-    NodeResults.
-
-% Performs a riak_kv_vnode:fold(), and invokes logging functions for each key in this partition
-process_vnode(Vnode, OutputDir, Options, NodeResultAccumulator) ->
-    Node = node(),
-
-    CountsFilename = filename:join(OutputDir, [io_lib:format("~s-~p-counts.log", [Node, Vnode])]),
-
-    {InitialAccumulator,ProcessObj} = processObj(Options, Vnode),
-
-    lager:info("Begin processing partition ~p, with options: ~p",[Vnode, Options]),
-
-    Results = riak_kv_vnode:fold({Vnode, Node}, ProcessObj, InitialAccumulator),
-    NewNodeResultAccumulator = write_vnode_totals(CountsFilename, Results, NodeResultAccumulator),
-
-    lager:info("Complete processing partition ~p",[Vnode]),
-    NewNodeResultAccumulator.
-
-write_vnode_totals(OutputFilename, Results, NodeResultAccumulator) ->
-    case dict:is_key(<<"BucketKeyCounts">>, Results) of
-        true ->
-            VnodeKeyCountDict = case dict:is_key(<<"VnodeKeyCounts">>, NodeResultAccumulator) of
-                true -> dict:fetch(<<"VnodeKeyCounts">>, NodeResultAccumulator);
-                false -> dict:new()
-            end,
-
-            {ok, File} = file:open(OutputFilename, [write]),
-            Counts = dict:to_list(dict:fetch(<<"BucketKeyCounts">>, Results)),
-            WriteBucketFun = fun(BucketCount, VnodeKeyCountAcc) ->
-                {Bucket, Count} = BucketCount,
-                io:format(File,"{~p,~B}.~n", [Bucket, Count]),
-                dict:update_counter(Bucket, Count, VnodeKeyCountAcc)
-            end,
-            NewVnodeKeyCountDict = lists:foldl(WriteBucketFun, VnodeKeyCountDict,Counts), %% TODO foreach
-            file:close(File),
-            dict:store(<<"VnodeKeyCounts">>, NewVnodeKeyCountDict, NodeResultAccumulator);
-
-        _ -> NodeResultAccumulator %% TODO return a result
+dict_merge_fun(_Key, Value1, Value2) ->
+    lager:debug("Merging: Encountered ~p with value ~p and ~p with value ~p", 
+        [type_of(Value1), Value1, type_of(Value2), Value2]),
+    case {type_of(Value1), type_of(Value2)} of
+        {integer,integer} -> Value1 + Value2;
+        {string, string} -> [Value1, Value2];
+        {string, list} -> [Value1 | Value2];
+        {list, list} -> [Value1 | Value2];
+        {dict, dict} -> dict:merge(fun dict_merge_fun/3, Value1, Value2);
+        {TV1,TV2} -> throw(
+            lists:flatten(
+                io_lib:format(
+                    "Failed to merge.  Encountered ~p with value ~p and ~p with value ~p",
+                    [TV1, Value1, TV2, Value2])))
     end.
 
-write_node_totals(OutputFilename, Results) ->
-    case dict:is_key(<<"VnodeKeyCounts">>, Results) of
-        true ->
-            {ok, File} = file:open(OutputFilename, [write]),
-            Counts = dict:to_list(dict:fetch(<<"VnodeKeyCounts">>, Results)),
-            WriteBucketFun = fun(BucketCount) ->
-                {Bucket, Count} = BucketCount,
-                io:format(File,"{~p,~B}.~n", [Bucket, Count])
-            end,
-            lists:foreach(WriteBucketFun, Counts),
-            file:close(File);
-        _ -> ok 
-    end.
-
-processOptions(Options, Vnode, Acc) ->
-    OutputDir = proplists:get_value(output_dir, Options, "/var/tmp"),
-    SleepFor = proplists:get_value(sleep_for, Options, undefined),
-    InitialAccumulator = dict:new(),    
-    processOptions(Options, Vnode, OutputDir, SleepFor, InitialAccumulator, Acc).
-
-processOptions([], _Vnode, _OutputDir, _SleepFor, InitialAccumulator, {Uses, Funs}) ->
-    {InitialAccumulator, Uses, Funs};
-
-processOptions([Option|Rest], Vnode, OutputDir, SleepFor, InitialAccumulator, {Uses, Funs} = Acc) ->
-    Node = node(), 
-
-    case Option of
-        log_keys ->
-            KeysFilename = filename:join(OutputDir, [io_lib:format("~s-~p-keys.log", [Node, Vnode])]),
-            {ok, File} = file:open(KeysFilename, [write]),
-            ProcessFun = case SleepFor of
-                SleepPeriod when is_integer(SleepPeriod)->
-                    fun(Bucket, Key, _Object, _ObjBinary, AccDict) ->
-                        io:format(File,"{~p,~p}.~n", [Bucket, Key]),
-                        timer:sleep(SleepPeriod),
-                        AccDict
-                    end;
-
-                undefined -> 
-                    fun(Bucket, Key, _Object, _ObjBinary, AccDict) ->
-                        io:format(File,"{~p,~p}.~n", [Bucket, Key]),
-                        AccDict
-                    end;
-
-                Stupid ->
-                    throw(io_lib:format("Bad value provided for `sleep_for` - [~p]",[Stupid]))
-                end,            
-            processOptions(Rest, Vnode, OutputDir, SleepFor, InitialAccumulator, {Uses, [ProcessFun | Funs]});
-
-        count_keys ->
-            ProcessFun = fun(Bucket, _Key, _Object, _ObjBinary, ProcessAccDict) ->
-                CountDict = dict:update_counter(Bucket, 1, dict:fetch(<<"BucketKeyCounts">>, ProcessAccDict)),
-                dict:store(<<"BucketKeyCounts">>, CountDict, ProcessAccDict)
-            end,
-            NewAccumulator = dict:store(<<"BucketKeyCounts">>, dict:new(), InitialAccumulator),
-            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {Uses, [ProcessFun | Funs]});
-
-        delete_object ->
-            ProcessFun = fun(Bucket, Key, _Object, _ObjBinary, ProcessAccDict) ->
-                {ok, Client} = riak:local_client(),
-                case Client:delete(Bucket, Key) of 
-                    ok ->
-                        DeleteCountDict = dict:update_counter(success, 1, dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict));
-                    _ -> 
-                        DeleteCountDict = dict:update_counter(error, 1, dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict))
-                end,
-                dict:store(<<"DeleteResultCounts">>, DeleteCountDict, ProcessAccDict)
-            end,
-            NewAccumulator = dict:store(<<"DeleteResultCounts">>, dict:new(), InitialAccumulator),
-            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {Uses, [ProcessFun | Funs]});
-
-        {copy_object, DestinationBucket} ->
-            ProcessFun = fun(_Bucket, Key, Object, _ObjBinary, ProcessAccDict) ->
-                {ok, Client} = riak:local_client(),
-                case Client:put(riak_object:new(DestinationBucket, Key, riak_object:get_values(Object), riak_object:get_metadatas(Object))) of 
-                    ok ->  
-                        CopyCountDict = dict:update_counter(success, 1, dict:fetch(<<"CopyResultCounts">>, ProcessAccDict));
-                    _ -> 
-                        CopyCountDict = dict:update_counter(false, 1, dict:fetch(<<"CopyResultCounts">>, ProcessAccDict))
-                end,
-                dict:store(<<"CopyResultCounts">>, CopyCountDict, ProcessAccDict)
-            end,
-            NewAccumulator = dict:store(<<"CopyResultCounts">>, dict:new(), InitialAccumulator),
-            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {true, [ProcessFun | Funs]});
-
-        direct_delete_object ->
-            ProcessFun = fun(Bucket, Key, _Object, _ObjBinary, ProcessAccDict) ->
-                case local_direct_delete(Vnode, Bucket, Key) of 
-                    ok ->
-                        DeleteCountDict = dict:update_counter(success, 1, dict:fetch(<<"DirectDeleteResultCounts">>, ProcessAccDict));
-                    _ -> 
-                        DeleteCountDict = dict:update_counter(error, 1, dict:fetch(<<"DirectDeleteResultCounts">>, ProcessAccDict))
-                end,
-                dict:store(<<"DirectDeleteResultCounts">>, DeleteCountDict, ProcessAccDict)
-            end,
-            NewAccumulator = dict:store(<<"DirectDeleteResultCounts">>, dict:new(), InitialAccumulator),
-            processOptions(Rest, Vnode, OutputDir, SleepFor, NewAccumulator, {Uses, [ProcessFun | Funs]});
-            
-        log_siblings ->
-            error("log_siblings is not implemented yet",[]);
-
-        _ -> processOptions(Rest, Vnode, OutputDir, SleepFor, InitialAccumulator, Acc)
-    end.        
-
-processObj(Options, Vnode) ->
-    {ProcessAccumulator, ProcessesUseObjects, FoldFuns} = processOptions(Options, Vnode, {false,[]}),
-    {InitialAccumulator, FiltersUseObjects, FilterFuns} = processFilters(Options, Vnode, {ProcessAccumulator,false,[]}),
-    UseObjects = ProcessesUseObjects or FiltersUseObjects,
-
-    ProcessFun = fun({Bucket, Key}, ObjBinary, AccDict) ->
-        {BucketType, BucketName} = case is_tuple(Bucket) of 
-            true ->
-                Bucket;
-            _ ->
-                {none, Bucket}
-        end,
-        Object = case UseObjects of 
-            true -> unserialize(Bucket, Key, ObjBinary);
-            false -> not_unserialized
-        end,
-        case lists:dropwhile(fun(X) -> X(BucketType, BucketName, Key, Object, ObjBinary) end, FilterFuns) of 
-            [] -> lists:foldl(fun(X, Acc) -> X(Bucket, Key, Object, ObjBinary, Acc) end, AccDict, FoldFuns);
-            _ -> AccDict   %% this just means that one of the filters evaluated to false and we shouldn't try to deal with it
-        end
-    end,
-    {InitialAccumulator, ProcessFun}.
-
-processFilters([], _Vnode, {ProcessAccumulator, Uses, Funs}) ->
-    {ProcessAccumulator, Uses, lists:reverse(Funs)};
-
-processFilters([Option|Rest], Vnode, {ProcessAccumulator, Uses, Funs} = Acc) ->
-    case Option of
-        {bucket_type, FilteredBucketType} ->
-            FilterFun = fun(BucketType, _BucketName, _Key, _Object, _Binary) ->
-                FilteredBucketType =:= BucketType
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
-
-        {bucket_name, FilteredBucketName} ->
-            FilterFun = fun(_BucketType, BucketName, _Key, _Object, _Binary) ->
-                FilteredBucketName =:= BucketName
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
-        
-        {bucket_name_prefix, BucketPrefix} ->
-            FilterFun = fun(_BucketType, BucketName, _Key, _Object, _Binary) ->
-                isBinaryPrefix(BucketPrefix, BucketName)
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
-
-        {key_prefix, KeyPrefix} ->
-            FilterFun = fun(_BucketType, _BucketName, Key, _Object, _Binary) ->
-                isBinaryPrefix(KeyPrefix, Key)
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
-            
-        {object_size_gte, ThresholdSize} ->
-            FilterFun = fun(_BucketType, _BucketName, _Key, _Object, Binary) ->
-                erlang:byte_size(Binary) >= ThresholdSize
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, Uses, [FilterFun | Funs]});
-
-        {sibling_count_gte, ThresholdCount} ->
-            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
-                length(riak_object:get_values(Object)) >= ThresholdCount
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, true, [FilterFun | Funs]});
-
-        {sibling_count_gte, ThresholdCount} ->
-            FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
-                length(riak_object:get_values(Object)) >= ThresholdCount
-            end,
-            processFilters(Rest, Vnode, {ProcessAccumulator, true, [FilterFun | Funs]});
-
-        _ -> 
-            processFilters(Rest, Vnode, Acc)
-    end.        
 
 isBinaryPrefix(PrefixCandidate, Value) when is_binary(PrefixCandidate), is_binary(Value) ->
     PrefixSize = byte_size(PrefixCandidate),
@@ -546,4 +698,218 @@ isBinaryPrefix(PrefixCandidate, Value) when is_binary(PrefixCandidate), is_binar
     end;
 
 isBinaryPrefix(_, _) -> false.
+
+send_delete_message_to_vnode(PartitionNumber, BKey, RObj) ->
+    VNodeName = list_to_atom(lists:flatten(io_lib:format(
+        "proxy_riak_kv_vnode_~s",[integer_to_list(PartitionNumber)]))),
+    VNodePid = whereis(VNodeName),
+    VNodePid ! {final_delete, BKey, delete_hash(RObj)}.
+
+%% Compute a hash of the deleted object
+delete_hash(RObj) ->
+    erlang:phash2(RObj, 4294967296).
+
+vnode_get(Bucket, Key) ->
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+    vnode_get(Ring, Bucket, Key).
+
+vnode_get(Ring, Bucket, Key) ->
+    Responses = query_vnodes(Ring, Bucket, Key),
+    Values = get_values_from_responses(Responses),
+    resolve_replicas(Values).
+
+query_vnodes(Ring, Bucket, Key) ->
+    BKey = {Bucket, Key},
+    DocIdx = riak_core_util:chash_key(BKey),
+    Preflist = riak_core_ring:preflist(DocIdx, Ring),
+    riak_kv_vnode:get(Preflist, BKey, 123456789),
+    VNodeCount = length(riak_core_ring:all_owners(Ring)),
+    wait_for_responses(VNodeCount,[]).
+
+wait_for_responses(MaxCount) ->
+    wait_for_responses(MaxCount,[]).
+
+wait_for_responses(MaxCount, Acc) ->
+    wait_for_responses(MaxCount, Acc, 30000).
+
+wait_for_responses(MaxCount, Acc, Timeout) ->
+    receive
+        {'$gen_event',{r, Msg, PartitionNumber, _ReqId}} ->
+            NewAcc = [{PartitionNumber, Msg}|Acc],
+            case length(NewAcc) >= MaxCount of
+                true -> NewAcc;
+                false -> wait_for_responses(MaxCount, NewAcc)
+            end
+    after Timeout ->
+        {error, timeout, {collected_values, Acc}}
+    end.
+
+get_values_from_responses(Responses) ->
+    %%  Responses should be a proplist in the form of:
+    %%  [ {PartitionNumber, Response}, ...]
+    {_,ResponseList} = lists:unzip(Responses),
+    FilteredList = lists:filter(
+        fun(Response) -> 
+            case Response of 
+                {error, notfound} -> false;
+                _ ->
+                    true
+                end
+            end, ResponseList),
+    ValueList = lists:map(
+        fun(Item) ->
+            case Item of
+                {ok, RObj} ->
+                    RObj;
+                _ ->
+                    Item
+            end
+        end, FilteredList),
+    case length(ValueList) == 0 of
+        true -> notfound;
+        false -> ValueList
+    end.
+
+resolve_replicas(List) ->
+    resolve_replicas(List,start).
+
+resolve_replicas([], Acc) ->
+    Acc;
+
+resolve_replicas([H|T], start) ->
+    resolve_replicas(T, H);
+
+resolve_replicas([H|T], Acc) ->
+    NewAcc = riak_object:syntactic_merge(H, Acc),
+    resolve_replicas(T, NewAcc).
+
+clean_cluster() ->
+    io:format("Cleaning cluster.~n"),
+    vnode_list_util:process_cluster_parallel(".",[direct_delete_object, unlogged]),
+    io:format("Removing log files from clean job.~n"),
+    os:cmd("rm ./*.log"),
+    io:format("Done cleaning cluster.~n~n"),
+    ok.
+
+
+add_index_to_bstr(Name,Index) ->
+    B = list_to_binary("_"++integer_to_list(Index)),
+    <<Name/binary, B/binary>>.
+
+build_test_data() ->
+    io:format("~n~nBuilding Test Data.~n"),
+    {ok, C} = riak:local_client(),
+    build_simple_data(C, <<"good">>, 100),
+    build_tombstone_data(C,<<"dead">>, 100),
+    build_time_test_data(C, <<"time">>, 100, 5, 30000),
+    io:format("Done Building Test Data.~n~n"),
+    ok.
+
+build_simple_data(Client, Bucket, NumObjects) ->
+    IndexList = lists:seq(1,NumObjects),
+    io:format("Creating ~p objects in bucket ~p.~n",[NumObjects, Bucket]),
+    lists:map(fun(I) ->
+        Client:put(riak_object:new(
+            Bucket, add_index_to_bstr(<<"Key">>, I), add_index_to_bstr(<<"Value">>, I)))
+    end, IndexList).
+
+build_tombstone_data(Client, Bucket, NumObjects) ->
+    case application:get_env(riak_kv,delete_mode) of
+        {ok, keep} ->
+           IndexList = lists:seq(1,NumObjects),
+           io:format("Creating ~p tombstone objects in bucket ~p.~n",[NumObjects, Bucket]),
+            lists:map(fun(I) ->
+                Client:put(riak_object:new(
+                    Bucket, add_index_to_bstr(<<"Key">>, I), add_index_to_bstr(<<"Value">>, I)))
+             end, IndexList),
+            lists:map(fun(I) ->
+                Client:delete(Bucket, add_index_to_bstr(<<"Key">>, I))
+            end, IndexList);
+        _ ->
+            lager:info("Skipping build_tombstone_data, delete_mode is not keep"),
+            io:format("Skipping build_tombstone_data, delete_mode is not keep")
+    end.
+
+build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime) ->
+    build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, 1).
+
+build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iteration) ->
+    StartIndex = (Iteration-1) * NumObjects + 1,
+    EndIndex = Iteration * NumObjects,
+    Time = erlang:now(),
+    io:format("Creating ~p objects in batches of ~p with a ~p ms delay between batches",
+        [NumObjects*NumIterations, NumObjects, WaitTime]),
+    io:format(" -- check console.log for timings~n"),
+    lager:info("Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~p -- ~p/~p~n",
+        [StartIndex, EndIndex, NumObjects, Time, Iteration, NumIterations]),
+    lists:map(fun(I) ->
+        Client:put(
+            riak_object:new(
+                <<"time">>, 
+                add_index_to_bstr(<<"Key">>, I), 
+                add_index_to_bstr(<<"Value">>, I)))
+    end, lists:seq(StartIndex,EndIndex)),
+    case Iteration =< NumIterations of
+        true ->
+            case timer:apply_after(
+                WaitTime,
+                vnode_list_util, 
+                build_time_test_data, 
+                [Client, Bucket, NumObjects, NumIterations, WaitTime, Iteration+1]) of 
+
+                Scheduled = {ok,_} ->
+                    lager:debug("Scheduled more data to be built in ~p ms.  Result: ~p",
+                        [WaitTime, Scheduled]);
+                {error,Reason} -> 
+                    lager:error("Unable to schedule next time_test_data iteration. Reason:~p",
+                        [Reason])
+            end;
+        false ->
+            io:format("Timed Test Data Created"),
+            lager:info("Timed Test Data Created"),
+            ok
+    end.
+
+type_of(X) when is_integer(X)                      -> integer;
+type_of(X) when is_float(X)                        -> float;
+type_of(X) when is_list(X)                         -> list;
+type_of(X) when is_bitstring(X)                    -> bitstring;
+type_of(X) when is_binary(X)                       -> binary;
+type_of(X) when is_boolean(X)                      -> boolean;
+type_of(X) when is_function(X)                     -> function;
+type_of(X) when is_pid(X)                          -> pid;
+type_of(X) when is_port(X)                         -> port;
+type_of(X) when is_reference(X)                    -> reference;
+type_of(X) when is_atom(X)                         -> atom;
+type_of(X) when is_function(X)                     -> function;
+type_of(X) when is_tuple(X), element(1,X) =:= dict -> dict;
+type_of(X) when is_tuple(X)                        -> tuple;
+type_of(_X)                                        -> unknown.
+
+
+dict_pretty_print(Dict) when element(1,Dict) =:= dict ->
+    io:format("~s~n",[dict_pretty_print(Dict,0)]);
+
+dict_pretty_print(_) ->
+    erlang:error(badarg).
+
+%% @private
+dict_pretty_print(Dict, Depth)  ->
+    dict:fold(
+        fun(Key, Value, AccIn) -> [AccIn | pretty_print_element(Key, Value, Depth)] end,
+        [], 
+        Dict).
+
+%% @private
+pretty_print_element(Key, Value, Depth) when element(1,Value) =:= dict ->
+    io_lib:format("~s~p: ~n~s",[string:copies(" ",Depth*4),Key,dict_pretty_print(Value,Depth+1)]);
+
+%% @private
+pretty_print_element(Key, Value, Depth) ->
+    io_lib:format("~s~p: ~p~n",[string:copies(" ",Depth*4),Key,Value]).
+
+
+-ifdef(TEST).
+
+-endif.
 
