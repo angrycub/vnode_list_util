@@ -21,10 +21,6 @@
 %%
 %% -------------------------------------------------------------------
 
-%% TODOs
-%% * replace foreach loops with foldl loops, taking errors into account and returning them
-%% * once upon a time
-
 -module(vnode_list_util).
 -export([
     count_everything/1,
@@ -35,12 +31,24 @@
     log_all_keys_for_bucket/2,
     log_all_keys_for_bucket/3,
     resolve_all_siblings/1,
-    resolve_all_siblings_for_bucket/2
+    resolve_all_siblings_for_bucket/2,
+    reap_tombstones/2
     ]).
 
+%% shortcuts into the internals.  These should ultimately be replaced by public API funs above.
 -export([process_cluster_parallel/2, process_node/2]).
 
--export([build_test_data/0, build_time_test_data/6, clean_cluster/0, vnode_get/2]).
+%% exports for testing.  These will later be moved into a conditional include
+-export([build_test_data/0, build_time_test_data/7, clean_cluster/0, vnode_get/2]).
+
+%% exports for the simple IO protocol listener 
+-export([start_io_listener/0, stop_io_listener/1, io_listener/0, loop/0]).
+
+%% exports to stop the warnings.  eventually these can be wired in to shut things up
+-export([get_preflist_for_key/3, compare_content_dates/2, get_vtag/1, 
+         is_deleted/1, log_sibling_contents/2, last_valid_vtag/1, 
+         resolve_object_siblings/4, force_reconcile/3, log_or_resolve_siblings/5, 
+         wait_for_responses/1]).
 
 -compile([{parse_transform, lager_transform}]).
 
@@ -99,10 +107,22 @@ resolve_all_siblings_for_bucket(OutputDir, Bucket) ->
     process_cluster_serial(OutputDir, 
         [{output_dir,OutputDir},log_siblings, resolve_siblings, {bucket_name, Bucket}]).
 
+reap_tombstones(OutputDir, all) ->
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, 
+         direct_delete_replica, 
+         is_tombstone]);
 
+reap_tombstones(OutputDir, ThresholdDate) when 
+    is_tuple(ThresholdDate), tuple_size(ThresholdDate) =:= 3 ->
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, 
+         direct_delete_replica, 
+         is_tombstone, 
+         {last_modified_lte, ThresholdDate}]);
 
-
-
+reap_tombstones(_, _) ->
+    erlang:error(badarg).
 
 
 
@@ -115,8 +135,10 @@ resolve_all_siblings_for_bucket(OutputDir, Bucket) ->
 %% =================================================================================================
 %% For each node in the cluster, in parallel, load this module,
 %% and invoke the process_node() function on its vnodes.
+process_cluster_parallel(OutputDir, Option) when is_atom(Option)->
+    process_cluster_parallel(OutputDir, [Option]);
 
-process_cluster_parallel(OutputDir, Options) ->
+process_cluster_parallel(OutputDir, Options) when is_list(Options)->
     io:format("Scanning all nodes in parallel...~n"),
     Members = member_nodes(),
     load_module_on_nodes(?MODULE, Members),
@@ -139,7 +161,8 @@ process_cluster_parallel(OutputDir, Options) ->
                 [io_lib:format("cluster-counts.log", [])]),
             ClusterResults = lists:foldl(FoldFun, dict:new(), Results),
             write_node_totals(ClusterCountsFilename, ClusterResults),
-            dict_pretty_print(ClusterResults);
+            dict_pretty_print(ClusterResults),
+            ok;
         Failures ->
             lager:warning(
                 "Skipping cluster totals--One or more nodes failed to respond. [~p]",[Failures])
@@ -222,7 +245,7 @@ process_vnode(VNode, OutputDir, Options, NodeResultAccumulator) ->
 
 write_vnode_totals(OutputFilename, Results, NodeResultAccumulator) ->
     lager:info("~nResults:~n~s~nNodeResultAccumulator:~n~s~n",
-        [dict_pretty_print(Results), dict_pretty_print(NodeResultAccumulator)]), 
+        [dict_pretty_print(Results,0), dict_pretty_print(NodeResultAccumulator,0)]), 
     NewNodeResultAccumulator = dict:merge(fun dict_merge_fun/3, Results, NodeResultAccumulator),
     case dict:is_key(<<"BucketKeyCounts">>, Results) of
         true ->
@@ -240,7 +263,7 @@ write_vnode_totals(OutputFilename, Results, NodeResultAccumulator) ->
             end,
             NewVNodeKeyCountDict = lists:foldl(WriteBucketFun, VNodeKeyCountDict, Counts), 
             file:close(File),
-            NewNodeResultAccumulator;
+            dict:merge(fun dict_merge_fun/3,NewNodeResultAccumulator,NewVNodeKeyCountDict);
 
         _ -> NewNodeResultAccumulator %% TODO return a result
     end.
@@ -326,6 +349,9 @@ processOptions([Option|Rest], VNode, OutputDir, SleepFor, InitialAccumulator, {U
                     ok ->
                         DeleteCountDict = dict:update_counter(success, 1, 
                             dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict));
+                    {error, notfound} ->
+                        DeleteCountDict = dict:update_counter(notfound, 1, 
+                            dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict));
                     _ -> 
                         DeleteCountDict = dict:update_counter(error, 1, 
                             dict:fetch(<<"DeleteResultCounts">>, ProcessAccDict))
@@ -371,7 +397,7 @@ processOptions([Option|Rest], VNode, OutputDir, SleepFor, InitialAccumulator, {U
         log_siblings ->
             error("log_siblings is not implemented yet",[]);
         
-        {custom_processing_fun, ProcessFun, NeedsUnserializedObject, AccumulatorKey} when 
+        {custom_processing_fun, {ProcessFun, NeedsUnserializedObject, AccumulatorKey}} when 
         is_function(ProcessFun, 5), is_boolean(NeedsUnserializedObject) ->
             NewAccumulator = dict:store(AccumulatorKey, dict:new(), InitialAccumulator),
             case NeedsUnserializedObject of
@@ -429,7 +455,9 @@ processObj(Options, VNode) ->
 %% #################################################################################################
 
 processFilters([], _VNode, {ProcessAccumulator, Uses, Funs}) ->
-    {ProcessAccumulator, Uses, lists:reverse(Funs)};
+    RFuns = lists:reverse(Funs),
+    lager:debug("Process Funs Selected~n~p",[RFuns]),
+    {ProcessAccumulator, Uses, RFuns};
 
 processFilters([Option|Rest], VNode, {ProcessAccumulator, Uses, Funs} = Acc) ->
     case Option of
@@ -469,9 +497,17 @@ processFilters([Option|Rest], VNode, {ProcessAccumulator, Uses, Funs} = Acc) ->
             end,
             processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
 
-        {create_date_lte, ThresholdCount} ->
+        {last_modified_lte, ErlangDateTime } when is_tuple(ErlangDateTime), 
+            tuple_size(ErlangDateTime) =:= 3, 
+            is_integer(element(1, ErlangDateTime)),
+            is_integer(element(2, ErlangDateTime)),
+            is_integer(element(3, ErlangDateTime)) ->
+
             FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
-                length(riak_object:get_values(Object)) >= ThresholdCount
+                LastModified = dict:fetch(<<"X-Riak-Last-Modified">>,
+                    riak_object:get_metadata(Object)),
+                lager:info("Is ~p =< ~p? ~p~n",[LastModified,ErlangDateTime,LastModified =< ErlangDateTime]),
+                LastModified =< ErlangDateTime
             end,
             processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
 
@@ -785,7 +821,7 @@ resolve_replicas([H|T], Acc) ->
 
 clean_cluster() ->
     io:format("Cleaning cluster.~n"),
-    vnode_list_util:process_cluster_parallel(".",[direct_delete_object, unlogged]),
+    vnode_list_util:process_cluster_parallel(".",[direct_delete_replica, unlogged]),
     io:format("Removing log files from clean job.~n"),
     os:cmd("rm ./*.log"),
     io:format("Done cleaning cluster.~n~n"),
@@ -801,7 +837,7 @@ build_test_data() ->
     {ok, C} = riak:local_client(),
     build_simple_data(C, <<"good">>, 100),
     build_tombstone_data(C,<<"dead">>, 100),
-    build_time_test_data(C, <<"time">>, 100, 5, 30000),
+    build_time_test_data(C, <<"time">>, 100, 5, timer:seconds(2)),
     io:format("Done Building Test Data.~n~n"),
     ok.
 
@@ -831,15 +867,19 @@ build_tombstone_data(Client, Bucket, NumObjects) ->
     end.
 
 build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime) ->
-    build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, 1).
+    ListenerPid = start_io_listener(),
+    spawn(fun() -> timer:sleep(1000), build_time_test_data(Client, Bucket, NumObjects,
+        NumIterations, WaitTime, 1, ListenerPid) end).
 
-build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iteration) ->
+build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iteration, ListenerPid) ->
     StartIndex = (Iteration-1) * NumObjects + 1,
     EndIndex = Iteration * NumObjects,
     Time = erlang:now(),
     io:format("Creating ~p objects in batches of ~p with a ~p ms delay between batches",
         [NumObjects*NumIterations, NumObjects, WaitTime]),
     io:format(" -- check console.log for timings~n"),
+    io:format(ListenerPid, "Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~w -- ~p/~p~n",
+        [StartIndex, EndIndex, NumObjects, Time, Iteration, NumIterations]),
     lager:info("Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~p -- ~p/~p~n",
         [StartIndex, EndIndex, NumObjects, Time, Iteration, NumIterations]),
     lists:map(fun(I) ->
@@ -855,7 +895,7 @@ build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iterat
                 WaitTime,
                 vnode_list_util, 
                 build_time_test_data, 
-                [Client, Bucket, NumObjects, NumIterations, WaitTime, Iteration+1]) of 
+                [Client, Bucket, NumObjects, NumIterations, WaitTime, Iteration+1, ListenerPid]) of 
 
                 Scheduled = {ok,_} ->
                     lager:debug("Scheduled more data to be built in ~p ms.  Result: ~p",
@@ -865,8 +905,9 @@ build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iterat
                         [Reason])
             end;
         false ->
-            io:format("Timed Test Data Created"),
-            lager:info("Timed Test Data Created"),
+            io:format(ListenerPid,"Timed Test Data Created~n",[]),
+            lager:info("Timed Test Data Created~n",[]),
+            stop_io_listener(ListenerPid),
             ok
     end.
 
@@ -909,6 +950,51 @@ pretty_print_element(Key, Value, Depth) ->
     io_lib:format("~s~p: ~p~n",[string:copies(" ",Depth*4),Key,Value]).
 
 
+%% @private
+%% Handle remote IO
+start_io_listener() ->
+    spawn(?MODULE, io_listener, []).
+
+io_listener() ->
+    lager:info("Starting IO Listener.  PID: ~p.~n",[self()]),
+    loop().
+
+loop() ->
+    receive
+        stop ->
+            lager:info("Stop Requested.  Stopping."),
+            exit("Stopping");
+        ping -> io:format("pong");
+        {io_request, From, ReplyAs, Request} ->
+            case request(Request) of
+            {Tag, Reply} when Tag =:= ok; Tag =:= error ->
+                reply(From, ReplyAs, Reply),
+                ?MODULE:loop();
+            {stop, Reply} ->
+                reply(From, ReplyAs, Reply),
+                exit(Reply)
+            end;
+        _Unknown ->
+            ?MODULE:loop()
+    end.
+
+reply(From, ReplyAs, Reply) ->
+    From ! {io_reply, ReplyAs, Reply}.
+
+stop_io_listener(ListenerPid) ->
+    timer:sleep(timer:seconds(5)),
+    ListenerPid ! stop.
+
+request({put_chars,unicode,io_lib,format,List}) when is_list(List) ->
+    Message = hd(List),
+    Options = lists:flatten(tl(List)),
+    io:format("AsyncIO: " ++ Message, Options),
+    {ok,ok};
+
+request(Request) ->
+    io:format("AsyncIO: Unknown Message - ~p~n", [Request]),
+    {ok,ok}.
+    
 -ifdef(TEST).
 
 -endif.
