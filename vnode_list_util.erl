@@ -30,6 +30,7 @@
     log_all_keys/2,
     log_all_keys_for_bucket/2,
     log_all_keys_for_bucket/3,
+    read_repair_all_objects/1,
     resolve_all_siblings/1,
     resolve_all_siblings_for_bucket/2,
     reap_tombstones/2
@@ -99,6 +100,10 @@ log_all_keys_for_bucket(OutputDir, Bucket, SleepPeriod) -> %% SleepPeriod is in 
     process_cluster_parallel(OutputDir, 
         [{output_dir,OutputDir}, log_keys, {sleep_for, SleepPeriod}, {bucket_name, Bucket}]).
 
+read_repair_all_objects(OutputDir) ->
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, is_not_tombstone, get_keys]).
+
 resolve_all_siblings(OutputDir) ->
     process_cluster_serial(OutputDir, 
         [{output_dir,OutputDir}, log_siblings, resolve_siblings]).
@@ -120,6 +125,17 @@ reap_tombstones(OutputDir, ThresholdDate) when
          direct_delete_replica, 
          is_tombstone, 
          {last_modified_lte, ThresholdDate}]);
+
+reap_tombstones(OutputDir, {Date,Time}) when 
+    is_tuple(Date), tuple_size(Date) =:= 3,
+    is_tuple(Time), tuple_size(Time) =:= 3 ->
+    %% Conversion from gregorian seconds (year 0 based) to linux epoch seconds (year 1970 based).
+    Timestamp = calendar:datetime_to_gregorian_seconds({Date,Time}) - calendar:datetime_to_gregorian_seconds({{1970,1,1},{0,0,0}}),
+    process_cluster_parallel(OutputDir, 
+        [{output_dir,OutputDir}, 
+         direct_delete_replica, 
+         is_tombstone, 
+         {last_modified_lte,{Timestamp div 1000000,Timestamp rem 1000000,0}}]);
 
 reap_tombstones(_, _) ->
     erlang:error(badarg).
@@ -309,6 +325,9 @@ processOptions([Option|Rest], VNode, OutputDir, SleepFor, InitialAccumulator, {U
 
     case Option of
         log_keys ->
+            %% This function will log {Bucket,Key} tuples (where Bucket could be {BucketType,Bucket})
+            %% to a file in the Destination directory.  This will emit this for every replica in the 
+            %% cluster, so there will be n-val repetitions (in the ideal case)
             KeysFilename = filename:join(
                 OutputDir, [io_lib:format("~s-~p-keys.log", [Node, VNode])]),
             {ok, File} = file:open(KeysFilename, [write]),
@@ -339,6 +358,26 @@ processOptions([Option|Rest], VNode, OutputDir, SleepFor, InitialAccumulator, {U
                 dict:store(<<"BucketKeyCounts">>, CountDict, ProcessAccDict)
             end,
             NewAccumulator = dict:store(<<"BucketKeyCounts">>, dict:new(), InitialAccumulator),
+            processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
+                {Uses, [ProcessFun | Funs]});
+        
+        get_object ->
+            ProcessFun = fun(Bucket, Key, _Object, _ObjBinary, ProcessAccDict) ->
+                {ok, Client} = riak:local_client(),
+                case Client:get(Bucket, Key) of 
+                    {ok, _} ->
+                        GetCountDict = dict:update_counter(success, 1, 
+                            dict:fetch(<<"GetResultCounts">>, ProcessAccDict));
+                    {error, notfound} ->
+                        GetCountDict = dict:update_counter(notfound, 1, 
+                            dict:fetch(<<"GetResultCounts">>, ProcessAccDict));
+                    _ -> 
+                        GetCountDict = dict:update_counter(error, 1, 
+                            dict:fetch(<<"GetResultCounts">>, ProcessAccDict))
+                end,
+                dict:store(<<"GetResultCounts">>, GetCountDict, ProcessAccDict)
+            end,
+            NewAccumulator = dict:store(<<"GetResultCounts">>, dict:new(), InitialAccumulator),
             processOptions(Rest, VNode, OutputDir, SleepFor, NewAccumulator, 
                 {Uses, [ProcessFun | Funs]});
 
@@ -383,6 +422,10 @@ processOptions([Option|Rest], VNode, OutputDir, SleepFor, InitialAccumulator, {U
                 {true, [ProcessFun | Funs]});
 
        direct_delete_replica ->
+            %% This is a dangerous function to use and should only be used once you understand the 
+            %% consequences.  This function sends the message to the vnode that is set to be sent 
+            %% by the timer that is set when an object is deleted.  This does not clean up secondary
+            %% indexes or search data.  
             ProcessFun = fun(Bucket, Key, Object, _ObjBinary, ProcessAccDict) ->
                 send_delete_message_to_vnode(VNode, {Bucket, Key}, Object),
                 DirectDeleteCountDict = dict:update_counter(delete_requested, 1, 
@@ -506,7 +549,7 @@ processFilters([Option|Rest], VNode, {ProcessAccumulator, Uses, Funs} = Acc) ->
             FilterFun = fun(_BucketType, _BucketName, _Key, Object, _Binary) ->
                 LastModified = dict:fetch(<<"X-Riak-Last-Modified">>,
                     riak_object:get_metadata(Object)),
-                lager:info("Is ~p =< ~p? ~p~n",[LastModified,ErlangDateTime,LastModified =< ErlangDateTime]),
+                lager:debug("Is ~p =< ~p? ~p~n",[LastModified,ErlangDateTime,LastModified =< ErlangDateTime]),
                 LastModified =< ErlangDateTime
             end,
             processFilters(Rest, VNode, {ProcessAccumulator, true, [FilterFun | Funs]});
@@ -878,10 +921,10 @@ build_time_test_data(Client, Bucket, NumObjects, NumIterations, WaitTime, Iterat
     io:format("Creating ~p objects in batches of ~p with a ~p ms delay between batches",
         [NumObjects*NumIterations, NumObjects, WaitTime]),
     io:format(" -- check console.log for timings~n"),
-    io:format(ListenerPid, "Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~w -- ~p/~p~n",
-        [StartIndex, EndIndex, NumObjects, Time, Iteration, NumIterations]),
-    lager:info("Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~p -- ~p/~p~n",
-        [StartIndex, EndIndex, NumObjects, Time, Iteration, NumIterations]),
+    io:format(ListenerPid, "Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~w[~w] -- ~p/~p~n",
+        [StartIndex, EndIndex, NumObjects, Time, calendar:now_to_universal_time(Time), Iteration, NumIterations]),
+    lager:info("Creating ~p:~p, ~p objects in bucket <<\"time\">> at ~p[~p] -- ~p/~p~n",
+        [StartIndex, EndIndex, NumObjects, Time, calendar:now_to_universal_time(Time), Iteration, NumIterations]),
     lists:map(fun(I) ->
         Client:put(
             riak_object:new(
